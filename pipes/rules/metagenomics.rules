@@ -7,9 +7,20 @@ rule all_metagenomics:
         expand(join(config["data_dir"], config["subdirs"]["metagenomics"],
                     "{sample}.raw.{method}.report"), sample=samples, method=['kraken', 'rna_bwa', 'rna_bwa.nodupes']),
         expand(join(config["data_dir"], config["subdirs"]["metagenomics"],
-                    "{sample}.raw.{method}.krona.html"), sample=samples, method=['kraken', 'rna_bwa', 'rna_bwa_nodupes'])
+                    "{sample}.raw.{method}.krona.html"), sample=samples, method=['kraken', 'rna_bwa', 'rna_bwa_nodupes']),
+        expand(join(config["data_dir"], config["subdirs"]["metagenomics"],
+                    "{sample}.rpsblast.tbl"), sample=samples)
     params: LSF='-N'
 
+rule all_metagenomics_contigs:
+    input:
+        expand(join(config["data_dir"], config["subdirs"]["metagenomics"],
+                    "{sample}.rpsblast.tbl"), sample=samples),
+        expand(join(config["data_dir"], config["subdirs"]["metagenomics"],
+                    "{sample}.infernal.tbl"), sample=samples),
+        # expand(join(config["data_dir"], config["subdirs"]["metagenomics"],
+        #             "{sample}.blastn.report"), sample=samples)
+    params: LSF='-N'
 
 rule all_metagenomics_host_depleted:
     input:
@@ -60,7 +71,7 @@ rule diamond:
             UGER=config.get('UGER_queues', {}).get('long', '-q long')
     shell:
         """
-        {config[bin_dir]}/metagenomics.py diamond {input} {config[diamond_db]} {config[taxonomy_db]} {output.report} --outLca {output.lca} --numThreads {params.numThreads}
+        {config[bin_dir]}/metagenomics.py diamond {input} {config[diamond_db]} {config[taxonomy_db]} {output.report} --outLca {output.lca} --numThreads {params.numThreads} --tmp_dir {config[tmp_dir]}
         """
 
 rule kraken:
@@ -73,7 +84,7 @@ rule kraken:
             UGER=config.get('UGER_queues', {}).get('long', '-q long')
     shell:
         """
-        {config[bin_dir]}/metagenomics.py kraken {input} {config[kraken_db]} --outReads {output.reads} --outReport {output.report} --numThreads {params.numThreads}
+        {config[bin_dir]}/metagenomics.py kraken {input} {config[kraken_db]} --outReads {output.reads} --outReport {output.report} --numThreads {params.numThreads} --tmp_dir {config[tmp_dir]}
         """
 
 rule align_rna:
@@ -89,7 +100,7 @@ rule align_rna:
             UGER=config.get('UGER_queues', {}).get('long', '-q long')
     shell:
         """
-        {config[bin_dir]}/metagenomics.py align_rna {input} {config[align_rna_db]} {config[taxonomy_db]} {output.nodupes_report} --dupeReport {output.report} --outBam {output.bam} --outLca {output.nodupes_lca} --dupeLca {output.lca} --JVMmemory {resources.mem}g --numThreads {params.numThreads}
+        {config[bin_dir]}/metagenomics.py align_rna {input} {config[align_rna_db]} {config[taxonomy_db]} {output.report} --dupeReport {output.dupe_report} --outBam {output.bam} --outLca {output.lca} --dupeLca {output.nodupes_lca} --JVMmemory 30g --numThreads {params.numThreads} --tmp_dir {config[tmp_dir]}
         """
 
 rule krona_import_taxonomy:
@@ -100,4 +111,88 @@ rule krona_import_taxonomy:
     shell:
         """
         {config[bin_dir]}/metagenomics.py krona {input} {config[krona_db]} {output} --noRank
+        """
+
+rule unclassified_trinity:
+    ''' This step runs the Trinity assembler on Kraken unclassified reads.
+        First trim reads with trimmomatic, rmdup with prinseq,
+        and random subsample to no more than 100k reads.
+    '''
+    # input: join(config["data_dir"], config["subdirs"]["per_sample"], "{sample}.raw.bam")
+    input: bam=join(config["data_dir"], config["subdirs"]["per_sample"], "{sample}.raw.bam"),
+           kraken=join(config["data_dir"], config["subdirs"]["metagenomics"], "{sample}.raw.kraken.reads.gz")
+    output: config["tmp_dir"] +'/'+config["subdirs"]["metagenomics"]+'/{sample}.assembly-unclassified-trinity.fasta'
+    resources:
+            mem=16,
+            cores=int(config.get("number_of_threads", 1))
+    params: LSF=config.get('LSF_queues', {}).get('long', '-W 4:00'),
+            UGER=config.get('UGER_queues', {}).get('long', '-q long'),
+            extracted=join(config["tmp_dir"], config["subdirs"]["metagenomics"], "{sample}.kraken-unclassified.bam"),
+            logid="{sample}",
+            clipDb=config["trim_clip_db"],
+            subsamp_bam=config["tmp_dir"]+'/'+config["subdirs"]["assembly"]+'/{sample}.subsamp.bam',
+            numThreads=str(config.get("number_of_threads", 1))
+    shell:
+        '''
+        {config[bin_dir]}/metagenomics.py kraken_unclassified {input.kraken} {input.bam} {params.extracted}
+        {config[bin_dir]}/assembly.py assemble_trinity {params.extracted} {params.clipDb} {output} --n_reads 0 --outReads {params.subsamp_bam} --threads {params.numThreads} --JVMmemory 14g
+        '''
+
+rule cluster_contigs:
+    input: config["tmp_dir"] +'/'+config["subdirs"]["metagenomics"]+'/{sample}.assembly-unclassified-trinity.fasta'
+    output: config["tmp_dir"] + '/' + config["subdirs"]["metagenomics"] + '/{sample}.clustered.fasta'
+    resources:
+        mem=4,
+        cores=int(config.get("number_of_threads", 1))
+    params: LSF=config.get('LSF_queues', {}).get('short', '-W 4:00'),
+            UGER=config.get('UGER_queues', {}).get('short', '-q short'),
+    shell:
+        """
+        {config[bin_dir]}/metagenomics.py cluster_contigs {input} {output} --memory {resources.mem} --memory {resources.mem} --numThreads {resources.cores}
+        """
+
+rule blast_taxonomy:
+    input: config["tmp_dir"] + '/' + config["subdirs"]["metagenomics"] + '/{sample}.clustered.fasta'
+    output: blastn=config["data_dir"] + '/' + config["subdirs"]["metagenomics"] + '/{sample}.blastn.m8',
+            blastx=config["data_dir"] + '/' + config["subdirs"]["metagenomics"] + '/{sample}.blastx.m8',
+            blastn_report=config["data_dir"] + '/' + config["subdirs"]["metagenomics"] + '/{sample}.blastn.report',
+            blastx_report=config["data_dir"] + '/' + config["subdirs"]["metagenomics"] + '/{sample}.blastx.report'
+    resources:
+        mem=24,
+        cores=int(config.get("number_of_threads", 1))
+    params: LSF=config.get('LSF_queues', {}).get('short', '-W 4:00'),
+            UGER=config.get('UGER_queues', {}).get('long', '-q long'),
+    shell:
+        """
+        {config[bin_dir]}/metagenomics.py blast_taxonomy {input}  \
+          --ntDb {config[blast_nt]} --outBlastn {output.blastn} --outBlastnReport {output.blastn_report}  \
+          --nrDb {config[blast_nr]} --outBlastx {output.blastx} --outBlastxReport {output.blastx_report}  \
+          --taxDb {config[taxonomy_db]} --numThreads {resources.cores}
+        """
+
+rule rpsblast_contigs:
+    input: config["tmp_dir"] + '/' + config["subdirs"]["metagenomics"] + '/{sample}.clustered.fasta'
+    output: config["data_dir"] + '/' + config["subdirs"]["metagenomics"] + '/{sample}.rpsblast.tbl'
+    resources:
+        mem=32,
+        cores=int(config.get("number_of_threads", 1))
+    params: LSF=config.get('LSF_queues', {}).get('short', '-W 4:00'),
+            UGER=config.get('UGER_queues', {}).get('long', '-q long'),
+            ORFS=config["tmp_dir"] + '/' + config["subdirs"]["metagenomics"] + '/{sample}.orfs.fna'
+    shell:
+        """
+        {config[bin_dir]}/metagenomics.py rpsblast_models {config[rpsblast_dbs]} {input} {output} --numThreads {resources.cores} --orfs {params.ORFS}
+        """
+
+rule infernal_contigs:
+    input: config["tmp_dir"] + '/' + config["subdirs"]["metagenomics"] + '/{sample}.clustered.fasta'
+    output: config["data_dir"] + '/' + config["subdirs"]["metagenomics"] + '/{sample}.infernal.tbl'
+    resources:
+        mem=16,
+        cores=int(config.get("number_of_threads", 1))
+    params: LSF=config.get('LSF_queues', {}).get('short', '-W 4:00'),
+            UGER=config.get('UGER_queues', {}).get('long', '-q long'),
+    shell:
+        """
+        {config[bin_dir]}/metagenomics.py infernal_contigs {config[infernal_db]} {input} {output} --numThreads {resources.cores}
         """
